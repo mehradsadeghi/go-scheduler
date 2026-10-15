@@ -1,3 +1,5 @@
 .idea/
 cpu.prof
+g2o-scheduler.test
+before.txt
 go-scheduler.test

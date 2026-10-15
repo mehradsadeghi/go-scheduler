@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,7 +102,7 @@ func (s *Scheduler) startProcessing() {
 func (s *Scheduler) process(v Task) error {
 	s.currentRunningCount.Add(1)
 
-	totalExecutionTime := time.Millisecond * time.Duration(rand.IntN(200))
+	totalExecutionTime := time.Millisecond
 
 	// simulating short/long running task
 	<-time.After(totalExecutionTime)

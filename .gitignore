@@ -9,3 +9,4 @@ heap.prof
 mutex.prof
 threadcreate.prof
 trace.out
+leak.prof

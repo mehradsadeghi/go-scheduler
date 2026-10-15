@@ -8,3 +8,4 @@ goroutine.prof
 heap.prof
 mutex.prof
 threadcreate.prof
+trace.out

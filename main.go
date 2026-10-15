@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -20,18 +21,21 @@ Acceptance criteria:
 */
 
 var (
-	ErrSchedulerHasStopped   = errors.New("scheduler has stopped")
-	ErrMaxSubmissionExceeded = errors.New("max submission exceeded")
+	ErrSchedulerHasStopped         = errors.New("scheduler has stopped")
+	ErrMaxSubmissionExceeded       = errors.New("max submission exceeded")
+	ErrSubmissionBackpressureCount = errors.New("submission backpressure count must be greater than zero")
+	ErrWorkersCount                = errors.New("workers count must be greater than zero")
 )
 
 type Scheduler struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	tasks       chan Task
 	stopped     atomic.Bool
 	stoppedOnce sync.Once
+	shutdownCh  chan struct{}
 
 	maxSubmissionCount int32
 	workersCount       int32
@@ -40,7 +44,6 @@ type Scheduler struct {
 	currentRunningCount            atomic.Int32
 	totalCompletedCount            atomic.Int32
 	totalFailedCount               atomic.Int32
-	totalCanceledCount             atomic.Int32
 	totalRejectedCount             atomic.Int32
 	totalExecutionTimeMilliseconds atomic.Int32
 }
@@ -52,106 +55,97 @@ type Config struct {
 	WorkersCount                int32
 }
 
-func NewScheduler(parentCtx context.Context, cfg Config) *Scheduler {
+func NewScheduler(parentCtx context.Context, cfg Config) (*Scheduler, error) {
+	if cfg.SubmissionBackpressureCount <= 0 {
+		return &Scheduler{}, ErrSubmissionBackpressureCount
+	}
+	if cfg.WorkersCount <= 0 {
+		return &Scheduler{}, ErrWorkersCount
+	}
+
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	s := &Scheduler{
 		ctx:                ctx,
 		cancel:             cancel,
 		wg:                 sync.WaitGroup{},
-		mu:                 sync.Mutex{},
+		mu:                 sync.RWMutex{},
+		shutdownCh:         make(chan struct{}),
 		tasks:              make(chan Task, cfg.SubmissionBackpressureCount),
 		workersCount:       cfg.WorkersCount,
 		maxSubmissionCount: cfg.SubmissionBackpressureCount,
 	}
 
-	s.startProcessing(ctx)
+	s.startProcessing()
 
 	go func() {
-		<-parentCtx.Done()
-		s.Shutdown()
+		select {
+		case <-parentCtx.Done():
+			s.Shutdown()
+		case <-s.shutdownCh:
+			return
+		}
 	}()
 
-	return s
+	return s, nil
 }
 
-func (s *Scheduler) startProcessing(ctx context.Context) {
+func (s *Scheduler) startProcessing() {
 	for range s.workersCount {
 		s.wg.Go(func() {
-			for {
-				select {
-				case v, ok := <-s.tasks:
-					s.currentQueuedCount.Add(-1)
-					if !ok {
-						return
-					}
-					if ctx.Err() != nil {
-						s.totalCanceledCount.Add(1)
-						return
-					}
-					s.wg.Add(1)
-					if err := s.process(ctx, v); err != nil {
-						s.totalFailedCount.Add(1)
-					} else {
-						s.totalCompletedCount.Add(1)
-					}
-					s.currentRunningCount.Add(-1)
-					s.wg.Done()
-				case <-ctx.Done():
-					s.totalCanceledCount.Add(1)
-					return
+
+			for v := range s.tasks {
+				s.currentQueuedCount.Add(-1)
+				s.wg.Add(1)
+				if err := s.process(v); err != nil {
+					s.totalFailedCount.Add(1)
+				} else {
+					s.totalCompletedCount.Add(1)
 				}
+				s.currentRunningCount.Add(-1)
+				s.wg.Done()
 			}
 		})
-
 	}
 }
 
-func (s *Scheduler) process(ctx context.Context, v Task) error {
+func (s *Scheduler) process(v Task) error {
 	s.currentRunningCount.Add(1)
 
 	totalExecutionTime := time.Millisecond * time.Duration(rand.IntN(200))
-	select {
+
 	// simulating short/long running task
-	case <-time.After(totalExecutionTime):
-		// simulating failed task
-		if v.ID == 1 || v.ID == 2 {
-			return fmt.Errorf("bad id: %d", v.ID)
-		}
-		s.totalExecutionTimeMilliseconds.Add(int32(totalExecutionTime))
-	case <-ctx.Done():
-		s.totalCanceledCount.Add(1)
-		return ctx.Err()
+	<-time.After(totalExecutionTime)
+
+	// simulating failed task
+	if v.ID == 1 || v.ID == 2 {
+		return fmt.Errorf("bad id: %d", v.ID)
 	}
+	s.totalExecutionTimeMilliseconds.Add(int32(totalExecutionTime))
 
 	return nil
 }
 
 func (s *Scheduler) Submit(task Task) error {
-	s.mu.Lock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.stopped.Load() {
-		s.mu.Unlock()
 		s.totalRejectedCount.Add(1)
 		return ErrSchedulerHasStopped
 	}
 
-	// admission check
-	if len(s.tasks) >= int(s.maxSubmissionCount) {
-		s.mu.Unlock()
-		s.totalRejectedCount.Add(1)
-		return ErrMaxSubmissionExceeded
-	}
-
 	s.wg.Add(1)
-	s.mu.Unlock()
 	defer s.wg.Done()
 
 	select {
 	case s.tasks <- task:
 		s.currentQueuedCount.Add(1)
 	case <-s.ctx.Done():
-		s.totalCanceledCount.Add(1)
 		return s.ctx.Err()
+	default:
+		s.totalRejectedCount.Add(1)
+		return ErrMaxSubmissionExceeded
 	}
 
 	return nil
@@ -159,22 +153,23 @@ func (s *Scheduler) Submit(task Task) error {
 
 func (s *Scheduler) Stats() string {
 	return fmt.Sprintf(
-		"Current Queued: %d\nCurrent Running %d\nTotal Completed %d\nTotal Failed %d\nTotal Canceled %d\nTotal Rejected %d",
+		"Current Queued: %d\nCurrent Running %d\nTotal Completed %d\nTotal Failed %d\nTotal Rejected %d",
 		s.currentQueuedCount.Load(),
 		s.currentRunningCount.Load(),
 		s.totalCompletedCount.Load(),
 		s.totalFailedCount.Load(),
-		s.totalCanceledCount.Load(),
 		s.totalRejectedCount.Load(),
 	)
 }
 
 func (s *Scheduler) Shutdown() {
 	s.stoppedOnce.Do(func() {
+		close(s.shutdownCh)
 		s.mu.Lock()
 		s.stopped.Store(true)
-		s.cancel()
+		close(s.tasks)
 		s.mu.Unlock()
+		s.cancel()
 		s.wg.Wait()
 	})
 }
@@ -182,11 +177,16 @@ func (s *Scheduler) Shutdown() {
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	s := NewScheduler(ctx, Config{SubmissionBackpressureCount: 1000, WorkersCount: 4})
+	s, err := NewScheduler(ctx, Config{SubmissionBackpressureCount: 1000, WorkersCount: 4})
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 
 	var wg sync.WaitGroup
 
 	for i := range 2000 {
+		go s.Shutdown()
 		wg.Go(func() { _ = s.Submit(Task{ID: i}) })
 	}
 

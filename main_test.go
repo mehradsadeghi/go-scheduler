@@ -351,73 +351,15 @@ func TestScheduler_Stats(t *testing.T) {
 	}
 }
 
-func BenchmarkScheduler_Submit(b *testing.B) {
-	benchmarks := []struct {
-		name       string
-		submitters int
-		queueSize  int32
-		workers    int32
-	}{
-		{
-			name:       "LowContention",
-			submitters: 1,
-			queueSize:  1024,
-			workers:    4,
-		},
-		{
-			name:       "HighContention",
-			submitters: 16,
-			queueSize:  1024,
-			workers:    4,
-		},
-		{
-			name:       "HighContentionManySubmitters",
-			submitters: 64,
-			queueSize:  1024,
-			workers:    4,
-		},
-	}
-
-	for _, bm := range benchmarks {
-		b.Run(bm.name, func(b *testing.B) {
-			s, err := NewScheduler(context.Background(), Config{
-				WorkersCount:                bm.workers,
-				SubmissionBackpressureCount: bm.queueSize,
-			})
-			if err != nil {
-				b.Fatalf("NewScheduler() error = %v", err)
-			}
-
-			// Keep setup and shutdown outside the measured benchmark interval.
-			b.ResetTimer()
-
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-
-			for submitter := range bm.submitters {
-				submitter := submitter
-
-				wg.Go(func() {
-					<-start
-
-					for i := submitter; i < b.N; i += bm.submitters {
-						// IDs other than 1 and 2 simulate successful tasks.
-						// Queue-full errors are expected under contention.
-						_ = s.Submit(Task{ID: 100 + i})
-					}
-				})
-			}
-
-			close(start)
-			wg.Wait()
-
-			b.StopTimer()
-			s.Shutdown()
-		})
-	}
+func BenchmarkScheduler_SubmissionThroughput(b *testing.B) {
+	benchmarkSubmission(b, false)
 }
 
-func BenchmarkScheduler_SubmitParallel(b *testing.B) {
+func BenchmarkScheduler_SuccessfulSubmissionThroughput(b *testing.B) {
+	benchmarkSubmission(b, true)
+}
+
+func BenchmarkScheduler_Contention(b *testing.B) {
 	for _, submitters := range []int{1, 16, 64} {
 		b.Run(fmt.Sprintf("Submitters-%d", submitters), func(b *testing.B) {
 			s, err := NewScheduler(context.Background(), Config{
@@ -428,20 +370,103 @@ func BenchmarkScheduler_SubmitParallel(b *testing.B) {
 				b.Fatalf("NewScheduler() error = %v", err)
 			}
 
-			var nextID atomic.Int64
+			var successes atomic.Int64
+			var rejections atomic.Int64
+			var taskID atomic.Int64
 
+			b.ReportAllocs()
 			b.ResetTimer()
 
 			b.SetParallelism(submitters)
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					id := nextID.Add(1)
-					_ = s.Submit(Task{ID: int(id + 100)})
+					err := s.Submit(Task{
+						ID: int(taskID.Add(1) + 100),
+					})
+
+					if err == nil {
+						successes.Add(1)
+					} else {
+						rejections.Add(1)
+					}
 				}
 			})
 
 			b.StopTimer()
 			s.Shutdown()
+
+			elapsed := b.Elapsed().Seconds()
+			b.ReportMetric(float64(successes.Load())/elapsed, "successes/sec")
+			b.ReportMetric(float64(rejections.Load())/elapsed, "rejections/sec")
+		})
+	}
+}
+
+func benchmarkSubmission(b *testing.B, countSuccessfulOnly bool) {
+	cases := []struct {
+		name       string
+		submitters int
+	}{
+		{name: "LowContention", submitters: 1},
+		{name: "HighContention_16Submitters", submitters: 16},
+		{name: "HighContention_64Submitters", submitters: 64},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			s, err := NewScheduler(context.Background(), Config{
+				WorkersCount:                4,
+				SubmissionBackpressureCount: 1024,
+			})
+			if err != nil {
+				b.Fatalf("NewScheduler() error = %v", err)
+			}
+
+			var attempts atomic.Int64
+			var successes atomic.Int64
+			var rejections atomic.Int64
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+
+			for range tc.submitters {
+				wg.Go(func() {
+					<-start
+
+					for {
+						// Stop when this benchmark's operation budget is exhausted.
+						n := attempts.Add(1)
+						if n > int64(b.N) {
+							return
+						}
+
+						err := s.Submit(Task{ID: 100})
+
+						if err == nil {
+							successes.Add(1)
+						} else {
+							rejections.Add(1)
+						}
+					}
+				})
+			}
+
+			close(start)
+			wg.Wait()
+
+			b.StopTimer()
+			s.Shutdown()
+
+			b.ReportMetric(float64(attempts.Load()-1)/float64(b.Elapsed().Seconds()), "attempts/sec")
+			b.ReportMetric(float64(successes.Load())/float64(b.Elapsed().Seconds()), "successes/sec")
+			b.ReportMetric(float64(rejections.Load())/float64(b.Elapsed().Seconds()), "rejections/sec")
+
+			if countSuccessfulOnly {
+				b.ReportMetric(float64(successes.Load()), "successful-submissions")
+			}
 		})
 	}
 }

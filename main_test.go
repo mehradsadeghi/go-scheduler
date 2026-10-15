@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -347,5 +348,100 @@ func TestScheduler_Stats(t *testing.T) {
 		if !strings.Contains(stats, field) {
 			t.Errorf("Stats() = %q, missing field %q", stats, field)
 		}
+	}
+}
+
+func BenchmarkScheduler_Submit(b *testing.B) {
+	benchmarks := []struct {
+		name       string
+		submitters int
+		queueSize  int32
+		workers    int32
+	}{
+		{
+			name:       "LowContention",
+			submitters: 1,
+			queueSize:  1024,
+			workers:    4,
+		},
+		{
+			name:       "HighContention",
+			submitters: 16,
+			queueSize:  1024,
+			workers:    4,
+		},
+		{
+			name:       "HighContentionManySubmitters",
+			submitters: 64,
+			queueSize:  1024,
+			workers:    4,
+		},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			s, err := NewScheduler(context.Background(), Config{
+				WorkersCount:                bm.workers,
+				SubmissionBackpressureCount: bm.queueSize,
+			})
+			if err != nil {
+				b.Fatalf("NewScheduler() error = %v", err)
+			}
+
+			// Keep setup and shutdown outside the measured benchmark interval.
+			b.ResetTimer()
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+
+			for submitter := range bm.submitters {
+				submitter := submitter
+
+				wg.Go(func() {
+					<-start
+
+					for i := submitter; i < b.N; i += bm.submitters {
+						// IDs other than 1 and 2 simulate successful tasks.
+						// Queue-full errors are expected under contention.
+						_ = s.Submit(Task{ID: 100 + i})
+					}
+				})
+			}
+
+			close(start)
+			wg.Wait()
+
+			b.StopTimer()
+			s.Shutdown()
+		})
+	}
+}
+
+func BenchmarkScheduler_SubmitParallel(b *testing.B) {
+	for _, submitters := range []int{1, 16, 64} {
+		b.Run(fmt.Sprintf("Submitters-%d", submitters), func(b *testing.B) {
+			s, err := NewScheduler(context.Background(), Config{
+				WorkersCount:                4,
+				SubmissionBackpressureCount: 1024,
+			})
+			if err != nil {
+				b.Fatalf("NewScheduler() error = %v", err)
+			}
+
+			var nextID atomic.Int64
+
+			b.ResetTimer()
+
+			b.SetParallelism(submitters)
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					id := nextID.Add(1)
+					_ = s.Submit(Task{ID: int(id + 100)})
+				}
+			})
+
+			b.StopTimer()
+			s.Shutdown()
+		})
 	}
 }

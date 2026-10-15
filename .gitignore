@@ -3,3 +3,8 @@ cpu.prof
 g2o-scheduler.test
 before.txt
 go-scheduler.test
+block.prof
+goroutine.prof
+heap.prof
+mutex.prof
+threadcreate.prof

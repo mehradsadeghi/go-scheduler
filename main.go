@@ -11,15 +11,6 @@ import (
 	"time"
 )
 
-/*
-Acceptance criteria:
-- Provide a small demo that generates a mixture of: A burst of submissions that creates queue pressure.
-	- Include instructions for collecting a CPU profile, a heap profile, and a Go execution trace.
-		Use the results to investigate at least one actual bottleneck or scheduling behavior.
-	- Benchmarks cover at least low-contention and high-contention submission workloads.
-	- A CPU profile, heap profile, and execution trace can be collected from the demo.
-*/
-
 var (
 	ErrSchedulerHasStopped         = errors.New("scheduler has stopped")
 	ErrMaxSubmissionExceeded       = errors.New("max submission exceeded")
